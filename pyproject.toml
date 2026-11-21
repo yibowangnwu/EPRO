@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epro-rl"
+version = "0.1.0"
+description = "Execution-Policy Robust Optimization for verl"
+requires-python = ">=3.10,<3.13"
+license = "Apache-2.0"
+dependencies = ["torch>=2.6", "hydra-core>=1.3,<2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "tensordict>=0.10"]
+
+[tool.setuptools.packages.find]
+include = ["epro*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,9 @@
+# CPU-only integration dependencies. The GPU environment uses verl's frozen lockfile.
+transformers==5.12.1
+ray[default]==2.54.1
+tensordict==0.11.0
+datasets>=4,<6
+pyarrow>=20
+Pillow>=11
+codetiming>=1.4
+compressed-tensors==0.17.0

@@ -1,0 +1,8 @@
+EPRO contains extensions to verl and is distributed under Apache License 2.0.
+The algorithm file and integration patches retain/adapt code from verl:
+https://github.com/verl-project/verl
+Copyright 2024-2026 Bytedance Ltd. and/or its affiliates, and verl contributors.
+
+configs/nvfp4_w4a16.json is adapted from verl-recipe (Apache License 2.0):
+qat/config/nvfp4_w4a16.json, blob 5c8968431a4c7860c3145b0dab9238f6be4b5142.
+https://github.com/verl-project/verl-recipe

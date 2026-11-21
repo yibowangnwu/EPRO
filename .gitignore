@@ -1,0 +1,13 @@
+.venv/
+third_party/
+data/
+checkpoints/
+outputs/
+wandb/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+.DS_Store
+.env
+*tokens*

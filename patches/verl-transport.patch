@@ -1,0 +1,139 @@
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -1649,15 +1649,22 @@
+             return batch
+ 
+         # 1. compute log probs
++        tsc = bool(
++            (self.config.actor_rollout_ref.actor.policy_loss.get("rollout_correction", None) or {}).get("transported_sc", False)
++        )
+         batch.extra_info.update(
+             {
+                 "calculate_entropy": True,
+                 "compute_loss": False,
+                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
++                # transported SC: also record pi_0 on the sampler head (logits processor, collect mode)
++                "score_centering": tsc,
++                "tsc_collect_old_head": tsc,
+             }
+         )
+         output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
+         assert len(output) == len(batch)
++        batch.extra_info.update({"tsc_collect_old_head": False})
+ 
+         fields = ["entropy", "log_probs", "response_mask"]
+         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
+@@ -1845,9 +1852,8 @@
+                 and not distillation_loss_cfg.use_task_rewards
+                 and not distillation_loss_cfg.use_policy_gradient
+             )
+-        score_centering = bool(
+-            self.config.actor_rollout_ref.actor.policy_loss.get("rollout_correction", {}).get("score_centering", False)
+-        )
++        _rc = self.config.actor_rollout_ref.actor.policy_loss.get("rollout_correction", None) or {}
++        score_centering = bool(_rc.get("score_centering", False) or _rc.get("transported_sc", False))
+         extra_info = {
+             "calculate_entropy": calculate_entropy,
+             "distillation_use_topk": distillation_use_topk,
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -448,6 +448,9 @@
+ 
+         # for sft training, we need to compute loss in eval
+         loss_function = self.loss_fn if compute_loss else None
++        # transported SC: the old-log-prob pass also records the old trainer's head through the logits processor
++        if tu.get(data, key="tsc_collect_old_head", default=False):
++            loss_function = self.loss_fn
+ 
+         with (
+             self.engine.eval_mode(disable_auto_offload=disable_auto_offload),
+@@ -679,6 +682,12 @@
+                 self.loss_fn = partial(
+                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
+                 )
++            elif (actor_config.policy_loss.get("rollout_correction", None) or {}).get("transported_sc", False):
++                from verl.trainer.ppo.transported_sc import register_transport_loss, transported_sc_ppo_loss
++
++                register_transport_loss()
++
++                self.loss_fn = partial(transported_sc_ppo_loss, config=actor_config)
+             elif (actor_config.policy_loss.get("rollout_correction", None) or {}).get("score_centering", False):
+                 self.loss_fn = partial(score_centering_ppo_loss, config=actor_config)
+             else:
+diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
+--- a/verl/workers/utils/losses.py
++++ b/verl/workers/utils/losses.py
+@@ -100,6 +100,7 @@
+         fields.append("rollout_is_weights")
+     if "ref_log_prob" in data:
+         fields.append("ref_log_prob")
++    data_full = data
+     data = data.select(*fields).to_padded_tensor()
+ 
+     response_mask = data["response_mask"].to(bool)
+@@ -114,6 +115,29 @@
+ 
+     policy_loss_fn = get_policy_loss_fn(loss_mode)
+     policy_loss_kwargs = {"sc_correction": sc_outputs["sc_correction"]} if sc_outputs else {}
++    # transported SC (EPRO): per-token transport terms from its logits processor
++    tsc_outputs = {
++        key: no_padding_2_padding(model_output[key], data_full)
++        for key in (
++            "tsc_correction",
++            "tsc_log_z",
++            "tsc_rho",
++            "tsc_q_head_mass",
++            "tsc_p0_head_mass",
++            "tsc_u_head_mass",
++            "tsc_div_tv",
++            "tsc_div_kl",
++            "tsc_div_lrms",
++            "tsc_div_ln2",
++            "tsc_div_lninf",
++        )
++        if key in model_output
++    }
++    if tsc_outputs:
++        policy_loss_kwargs.update(tsc_correction=tsc_outputs["tsc_correction"], tsc_log_z=tsc_outputs["tsc_log_z"])
++        for key in ("tsc_div_tv", "tsc_div_kl", "tsc_div_lrms", "tsc_div_ln2", "tsc_div_lninf"):
++            if key in tsc_outputs:
++                policy_loss_kwargs[key] = tsc_outputs[key]
+     pg_loss, pg_metrics = policy_loss_fn(
+         old_log_prob=old_log_prob,
+         log_prob=log_prob,
+@@ -157,6 +181,12 @@
+                 value = masked_mean(sc_outputs[key], response_mask)
+                 aggregation = AggregationType.MEAN
+             metrics[f"actor/{key}"] = Metric(value=value, aggregation=aggregation)
++    if tsc_outputs:
++        for key in ("tsc_rho", "tsc_q_head_mass", "tsc_p0_head_mass", "tsc_u_head_mass"):
++            if key in tsc_outputs:
++                metrics[f"actor/{key}"] = Metric(
++                    value=masked_mean(tsc_outputs[key], response_mask), aggregation=AggregationType.MEAN
++                )
+     policy_loss = pg_loss
+ 
+     # add entropy loss
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -1432,7 +1432,7 @@
+                     cu_seqlens = input_ids.offsets()
+                     for k, v in outputs.items():
+                         v = v.squeeze(0)
+-                        assert v.shape == (logits_rmpad.shape[0],), (
++                        assert v.shape[0] == logits_rmpad.shape[0], (
+                             f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
+                         )
+                         v = self._gather_and_unpad_packed(v, output_args["pad_size"])
+@@ -1529,7 +1529,7 @@
+                         outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+                         for k, v in outputs.items():
+                             v = v.squeeze(0)
+-                            assert v.shape == (logits_rmpad.shape[0],), (
++                            assert v.shape[0] == logits_rmpad.shape[0], (
+                                 f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
+                             )
+                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)

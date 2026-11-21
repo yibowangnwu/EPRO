@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/verl-project/verl.git",
+  "commit": "4b26c788d41ce932ce7706c5ee8e249ab52f4c51",
+  "base_sha256": {
+    "verl/utils/qat/vllm_patch.py": "5e2b80a02d087b0a3b3238152da0b69eae8a3b94da1d29680ef74ab217fcf53a",
+    "verl/trainer/ppo/v1/trainer_base.py": "293af89dab738cc57a67a8cc730f3337622685e29d96dfdd2e9af1e6fc2144e8",
+    "verl/utils/qat/quantizer.py": "fd6c8b7bea85bc8aeeae56a4b63ab7989c12c15e2a8b9ab8e4e4e2ae0b302453",
+    "verl/workers/engine_workers.py": "3010078c6f1feec3520bd06ebd71ae88b6101367898f7af49c69e4dd60f37479",
+    "verl/workers/engine/fsdp/transformer_impl.py": "717b595c729469bde375234710b967e5b4a8d39ba93419f7b2a380f080483842",
+    "verl/workers/utils/losses.py": "31f9add3029e6729dfd38ff6107cb35a55f7188bcbd0b9f41c20f8991602e29e",
+    "verl/workers/rollout/vllm_rollout/utils.py": "0fb6ab8eb7a0f7579e96133062ea387e0886d773633a8f6abbe305c639eb0da5",
+    "verl/trainer/ppo/score_centering.py": "93e45b3a3ccb9688c65f31d858d20d244771b806dfb4c295fb1bb667492b3551"
+  }
+}

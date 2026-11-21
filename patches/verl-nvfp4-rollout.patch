@@ -1,0 +1,152 @@
+diff --git a/verl/utils/qat/quantizer.py b/verl/utils/qat/quantizer.py
+--- a/verl/utils/qat/quantizer.py
++++ b/verl/utils/qat/quantizer.py
+@@ -25,7 +25,18 @@
+ from typing import Generator, Iterable, Optional
+ 
+ import torch
+-from compressed_tensors.compressors.quantized_compressors.fp4_quantized import NVFP4PackedCompressor
++try:
++    from compressed_tensors.compressors.quantized_compressors.fp4_quantized import NVFP4PackedCompressor
++except ModuleNotFoundError:
++    # compressed-tensors >= 0.17 dropped the per-weight ``compress_weight`` API (local port, 10-22):
++    # reproduce it with the same primitives the new NVFP4PackedCompressor.compress uses.
++    from compressed_tensors.compressors.nvfp4.helpers import pack_fp4_to_uint8
++    from compressed_tensors.quantization.lifecycle.forward import quantize as _ct_quantize
++
++    class NVFP4PackedCompressor:
++        def compress_weight(self, weight, scale, global_scale, quantization_args, **kwargs):
++            q = _ct_quantize(x=weight, scale=scale, global_scale=global_scale, zero_point=None, args=quantization_args)
++            return {"weight_packed": pack_fp4_to_uint8(q)}
+ from compressed_tensors.quantization.quant_args import (
+     FP4_E2M1_DATA,
+     FP8_E4M3_DATA,
+diff --git a/verl/utils/qat/vllm_patch.py b/verl/utils/qat/vllm_patch.py
+--- a/verl/utils/qat/vllm_patch.py
++++ b/verl/utils/qat/vllm_patch.py
+@@ -734,9 +734,31 @@
+ _applied_patches = []
+ 
+ 
++def vllm_has_layerwise_nvfp4_reload() -> bool:
++    """True on vLLM versions (>=0.29 here) that dropped ``CompressedTensorsW4A16Fp4`` (W4A16 is now
++    ``CompressedTensorsW4A4Fp4(use_a16=True)`` behind ``init_nvfp4_linear_kernel``) and ship the generic
++    layerwise reload (``vllm.model_executor.model_loader.reload``). There the patches below have no target;
++    reloading goes through vLLM's own ``initialize_layerwise_reload`` / ``finalize_layerwise_reload``
++    instead (local port for the mismatch study, 10-22)."""
++    import importlib.util
++
++    try:
++        old_scheme = importlib.util.find_spec(
++            "vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a16_nvfp4"
++        )
++        reload_api = importlib.util.find_spec("vllm.model_executor.model_loader.reload")
++    except ModuleNotFoundError:
++        return False
++    return old_scheme is None and reload_api is not None
++
++
+ def apply_qat_patches():
+     """Apply NVFP4 patches to support dynamic weight updates. Call before model loading."""
+     global _applied_patches
++
++    if vllm_has_layerwise_nvfp4_reload():
++        logger.warning("QAT: vLLM has no CompressedTensorsW4A16Fp4; using vLLM layerwise reload instead of patches")
++        return _applied_patches
+ 
+     if _applied_patches:
+         logger.warning("QAT patches already applied, skipping")
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -277,12 +277,24 @@
+                 restore_moe_expert_maps(model)
+ 
+         if self._is_qat_model:
+-            # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
+-            from verl.utils.qat import prepare_qat_for_load_weights
+-
+-            for model in self._iter_all_models():
+-                prepare_qat_for_load_weights(model, device=self.device)
+-            logger.info("QAT: prepare_qat_for_load_weights completed")
++            from verl.utils.qat.vllm_patch import vllm_has_layerwise_nvfp4_reload
++
++            if vllm_has_layerwise_nvfp4_reload():
++                # Newer vLLM: restore checkpoint-layout params on meta and defer per-layer processing until each
++                # layer's packed NVFP4 weights have all arrived (safe across buckets); kernel tensors are kept
++                # and overwritten in place, so CUDA graphs stay valid.
++                from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
++
++                for model in self._iter_all_models():
++                    initialize_layerwise_reload(model)
++                logger.info("QAT: vLLM initialize_layerwise_reload completed")
++            else:
++                # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
++                from verl.utils.qat import prepare_qat_for_load_weights
++
++                for model in self._iter_all_models():
++                    prepare_qat_for_load_weights(model, device=self.device)
++                logger.info("QAT: prepare_qat_for_load_weights completed")
+         elif self._is_modelopt_qat:
+             from verl.utils.modelopt.vllm_modelopt_patch import prepare_modelopt_for_weight_reload
+ 
+@@ -340,12 +352,21 @@
+ 
+         # =========================== step 3: process weights after loading ===========================
+         if self._is_qat_model:
+-            # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
+-            from verl.utils.qat import manual_process_weights_after_loading
+-
+-            for model in self._iter_all_models():
+-                manual_process_weights_after_loading(model)
+-            logger.info("QAT: process_weights_after_loading completed")
++            from verl.utils.qat.vllm_patch import vllm_has_layerwise_nvfp4_reload
++
++            if vllm_has_layerwise_nvfp4_reload():
++                from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
++
++                for model, model_config in self._iter_all_models_with_config():
++                    finalize_layerwise_reload(model, model_config)
++                logger.info("QAT: vLLM finalize_layerwise_reload completed")
++            else:
++                # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
++                from verl.utils.qat import manual_process_weights_after_loading
++
++                for model in self._iter_all_models():
++                    manual_process_weights_after_loading(model)
++                logger.info("QAT: process_weights_after_loading completed")
+         elif self._is_modelopt_qat:
+             from verl.utils.modelopt.vllm_modelopt_patch import modelopt_process_weights_after_loading
+ 
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -603,7 +603,13 @@
+             module = self._build_lora_module(module)
+ 
+         # Apply QAT before FSDP wrapping (training only)
+-        if self._qat_enabled and not self.engine_config.forward_only:
++        # VERL_QAT_ROLLOUT_ONLY=1 (local mismatch study, 10-21): keep the actor in plain bf16 (no fake
++        # quantization) while still packing the synced weights to NVFP4 for the vLLM rollout.
++        if (
++            self._qat_enabled
++            and not self.engine_config.forward_only
++            and os.environ.get("VERL_QAT_ROLLOUT_ONLY", "0") != "1"
++        ):
+             module = self._apply_qat(module)
+ 
+         # Synchronize all distributed processes before proceeding
+@@ -1056,9 +1062,12 @@
+                 device=torch.device(get_device_id()),
+                 param_dtype=param_dtype,
+             )
++            # local knob (opsd 10-26): VERL_QAT_SYNC_DEVICE=gpu keeps packed NVFP4 tensors on the GPU for the
++            # rollout sync instead of a device->host->device round trip (upstream default: cpu).
++            _qat_out = torch.device(get_device_id()) if os.environ.get("VERL_QAT_SYNC_DEVICE") == "gpu" else torch.device("cpu")
+             per_tensor_param = quantizer.quantize_with_fusion(
+                 per_tensor_param,
+-                target_device=torch.device("cpu"),
++                target_device=_qat_out,
+             )
+ 
+         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
